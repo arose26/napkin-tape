@@ -18,14 +18,25 @@ So this repo is mostly selfchecks.
 ## What's in the tape
 
 Fixed universe of 18 symbols: 15 liquid megacaps (AAPL MSFT NVDA AMZN GOOGL META TSLA AVGO
-JPM V XOM LLY WMT COST UNH) + 3 cryptos (X:BTCUSD X:ETHUSD X:SOLUSD). Daily OHLCV from
-ClawStreet's own data API (100 bars deep at bootstrap, ~5 months), grown daily by a cron
-collector; hourly bars accumulate from collection start (the API only serves them intraday).
-The venue publishes bars without timestamps — bootstrap dates are inferred by walking the
-NYSE calendar back from the last completed session (marked `inferred`); every later collect
-anchors on live fetch dates and **asserts** the overlap matches what's already stored, so a
-silent history rewrite (split, adjustment, API change) fails loudly instead of corrupting
-the tape.
+JPM V XOM LLY WMT COST UNH) + 3 cryptos (X:BTCUSD X:ETHUSD X:SOLUSD). Two tapes:
+
+- **Bulk tape** (training depth): ~3 years of daily OHLCV per symbol — Yahoo's public v8
+  chart API for stocks, Coinbase Exchange public candles (USD pairs) for crypto. Free, no
+  keys, real timestamps.
+- **Venue tape** (parity + calibration): ClawStreet's own data API — only 100 daily bars
+  deep for stocks, 61 for crypto, and it publishes bars *without timestamps*, so dates are
+  inferred by walking the NYSE calendar back from the last completed session. A cron
+  collector grows it daily and accumulates the venue's intraday hourly bars (served
+  intraday only — they exist in bulk nowhere in this exact form).
+
+The **parity selfcheck** ties the two together: on every date where both tapes have a bar,
+closes must agree within 2% (absorbs dividend-adjustment differences; catches splits and
+any date misalignment loudly). At bootstrap: 720 overlapping bars, worst deviation 0.19%
+(ETH venue-vs-Coinbase basis) — which simultaneously validates the inferred dates (a
+one-day shift would blow the tolerance everywhere) and confirms the venue serves real
+market data. Any merge that would rewrite stored history also **asserts** instead of
+silently corrupting the tape. Training runs on bulk; deployment cadence must match training
+cadence (daily first — hourly arms only once the venue hourly tape has accumulated weeks).
 
 ## The sim
 
@@ -80,13 +91,39 @@ snapshot date):
 
 ## Results
 
-*(to be filled after the baselines run — predictions above are frozen first)*
+Ran 2026-08-19 against that day's 200-agent leaderboard snapshot, window 2026-06-08 →
+2026-08-18 (Season 2 start → last completed session):
+
+| policy | universe | return | fills | beats % of board |
+|---|---|---|---|---|
+| flat | — | +0.00% | 0 | — |
+| buy-and-hold | 18-sym | **+3.57%** | 18 | **92%** |
+| momentum | 18-sym | −1.43% | 63 | 10% |
+| buy-and-hold | stocks-only | +2.19% | 15 | 88% |
+| momentum | stocks-only | +4.64% | 61 | 92% |
+
+1. **Confirmed, understated**: predicted ≥60% of agents below buy-and-hold; actual **92%**.
+   The board's interquartile range is literally [0.00%, 0.00%] — **most registered agents
+   never trade**. "Mid-pack" on a public agent board is a wall of zeros.
+2. **Boundary case, reported as such**: 18-sym momentum landed 5.00 pp below B&H — exactly
+   at the registered ±5 pp edge (crypto momentum whipsawed it; the stocks-only pair sat
+   2.45 pp apart, inside the prediction).
+3. **Confirmed but trivially**: the baselines bracket the IQR, because the IQR is zero.
+   The registered wording survives; the interesting version of the question moves to the
+   *trading* subset of the board (repo 5's luck-share analysis).
+4. **Confirmed**: killing costs changes no ordering; total cost drag was 1 bp (B&H, 18
+   fills) and 4.8 bp (momentum, 63 fills) — far under the registered 10 bp/round-trip
+   ceiling at these position sizes.
+
+Sharpe-style risk stats for the board come free with the daily evidence archiver's
+per-agent equity curves; the risk-adjusted comparison table is repo 5's deliverable.
 
 ## Run it
 
 ```bash
-python3 napkin_tape.py collect     # bootstrap/extend the tape (needs ~/.clawstreet key)
-python3 napkin_tape.py selfcheck   # no network, synthetic tape — seconds
+python3 napkin_tape.py bulk        # ~3y daily history (Yahoo + Coinbase, no keys)
+python3 napkin_tape.py collect     # venue tape: bootstrap/extend (needs ~/.clawstreet key)
+python3 napkin_tape.py selfcheck   # synthetic-tape asserts + venue↔bulk parity — seconds
 python3 napkin_tape.py baselines   # flat / buy-and-hold / momentum vs archived leaderboard
 ```
 

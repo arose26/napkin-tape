@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """napkin-tape: a calibrated replay-market simulator built from ClawStreet's own bars.
 
-One file, three commands:
-  collect    pull daily (+intraday hourly) bars for the fixed universe into out/tape/
+One file, four commands:
+  bulk       deep daily history for training: Stooq CSV (stocks, ~3y) +
+             Coinbase Exchange candles (crypto USD pairs, ~3y) into out/tape/*.bulk.jsonl
+  collect    pull the venue's own daily (+intraday hourly) bars into out/tape/
+             (100/61 bars deep — parity + calibration, not training depth)
   selfcheck  no-network asserts on a synthetic tape: cost model to the cent,
              accounting identity vs an independently coded second implementation,
-             replay determinism, flat-policy invariance, look-ahead leak *caught*
+             replay determinism, flat-policy invariance, look-ahead leak *caught*;
+             plus venue-vs-bulk parity on the overlap window when both tapes exist
   baselines  flat / buy-and-hold / momentum on the real tape, vs archived leaderboard
 
 Repo 1 of the napkin-trader series. See README.md for registered hypotheses.
@@ -112,9 +116,12 @@ def collect():
     total = 0
     for sym in UNIVERSE:
         crypto = sym.startswith("X:")
-        h = _get(f"https://www.clawstreet.io/api/data/history?symbol={urllib.parse.quote(sym)}&periods=100",
-                 key)[sym]
-        time.sleep(PAUSE)
+        for attempt in range(3):  # API sporadically returns short arrays
+            h = _get(f"https://www.clawstreet.io/api/data/history?symbol={urllib.parse.quote(sym)}&periods=100",
+                     key)[sym]
+            time.sleep(PAUSE)
+            if len(h["prices"]) >= 95:
+                break
         o, hi, lo, c, v = h["open"], h["high"], h["low"], h["prices"], h["volumes"]
         n = len(c)
         # last bar is in-progress: always for 24/7 crypto, for stocks while market is open
@@ -150,13 +157,77 @@ def collect():
     # sanity on what's now stored
     for sym in UNIVERSE:
         days = [r for r in load_rows(sym) if r["res"] == "day"]
-        assert len(days) >= 95, f"{sym}: only {len(days)} daily bars"
+        need = 55 if sym.startswith("X:") else 95  # crypto history is only ~61 days deep
+        assert len(days) >= need, f"{sym}: only {len(days)} daily bars"
         ds = [r["date"] for r in days]
         assert ds == sorted(set(ds)), f"{sym}: dates not strictly increasing"
         if not sym.startswith("X:"):
             assert all(date.fromisoformat(x).weekday() < 5 for x in ds), f"{sym}: weekend bar"
     print(f"collect: +{total} bars across {len(UNIVERSE)} symbols "
           f"(anchor {anchor}, market {'open' if is_open else 'closed'})")
+
+
+# ---------------------------------------------------------------- bulk history
+
+def bulk_path(sym):
+    return os.path.join(TAPE_DIR, sym.replace(":", "_") + ".bulk.jsonl")
+
+
+def _yahoo_daily(sym, years=3):
+    """Yahoo v8 chart JSON, no key. Timestamps included; volume in shares;
+    split-adjusted quotes (dividends NOT backed out — matches venue closely)."""
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range={years}y&interval=1d"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        res = json.load(r)["chart"]["result"][0]
+    q = res["indicators"]["quote"][0]
+    rows = []
+    for i, ts in enumerate(res["timestamp"]):
+        if None in (q["open"][i], q["close"][i]):
+            continue  # yahoo emits null rows on halts
+        d = datetime.fromtimestamp(ts, ET).date()
+        rows.append({"res": "day", "date": d.isoformat(), "o": q["open"][i],
+                     "h": q["high"][i], "l": q["low"][i], "c": q["close"][i],
+                     "v": float(q["volume"][i] or 0)})
+    if rows and rows[-1]["date"] == datetime.now(ET).date().isoformat() \
+            and datetime.now(ET).hour < 16:
+        rows.pop()  # last bar is today's live partial
+    return rows
+
+
+def _coinbase_daily(sym, years=3):
+    """Coinbase Exchange public candles, USD pairs, 300 bars/call, no key."""
+    product = {"X:BTCUSD": "BTC-USD", "X:ETHUSD": "ETH-USD", "X:SOLUSD": "SOL-USD"}[sym]
+    rows, end = {}, datetime.now(ZoneInfo("UTC"))
+    start_cut = end - timedelta(days=365 * years)
+    while end > start_cut:
+        start = end - timedelta(days=299)
+        url = (f"https://api.exchange.coinbase.com/products/{product}/candles"
+               f"?granularity=86400&start={start.date()}T00:00:00Z&end={end.date()}T00:00:00Z")
+        req = urllib.request.Request(url, headers={"User-Agent": "napkin-tape/1.0"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            candles = json.load(r)  # [[time, low, high, open, close, volume], ...] newest first
+        for t, lo, hi, o, c, v in candles:
+            d = datetime.fromtimestamp(t, ZoneInfo("UTC")).date().isoformat()
+            rows[d] = {"res": "day", "date": d, "o": o, "h": hi, "l": lo, "c": c, "v": v}
+        end = start
+        time.sleep(0.4)  # coinbase public limit is generous; stay polite
+    rows.pop(datetime.now(ZoneInfo("UTC")).date().isoformat(), None)  # today = partial
+    return sorted(rows.values(), key=lambda r: r["date"])
+
+
+def bulk():
+    os.makedirs(TAPE_DIR, exist_ok=True)
+    for sym in UNIVERSE:
+        rows = _coinbase_daily(sym) if sym.startswith("X:") else _yahoo_daily(sym)
+        assert len(rows) >= 700, f"{sym}: bulk only returned {len(rows)} daily bars"
+        ds = [r["date"] for r in rows]
+        assert ds == sorted(set(ds)), f"{sym}: bulk dates not strictly increasing"
+        with open(bulk_path(sym), "w") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+        print(f"bulk: {sym:10} {len(rows)} daily bars  {ds[0]} → {ds[-1]}")
+        time.sleep(1.0)
 
 
 # ---------------------------------------------------------------- the sim
@@ -180,10 +251,13 @@ class Tape:
             self.bars[sym] = [by_d[d] for d in self.dates]
 
     @classmethod
-    def load(cls, since=None):
+    def load(cls, since=None, symbols=None, source="venue"):
         by_sym = {}
-        for sym in UNIVERSE:
-            rows = [r for r in load_rows(sym) if r["res"] == "day"]
+        for sym in (symbols or UNIVERSE):
+            if source == "bulk":
+                rows = [json.loads(l) for l in open(bulk_path(sym))]
+            else:
+                rows = [r for r in load_rows(sym) if r["res"] == "day"]
             if since:
                 rows = [r for r in rows if r["date"] >= since]
             by_sym[sym] = rows
@@ -366,51 +440,100 @@ def selfcheck():
     assert v.closes("SYN1", 5) == [tape.bars["SYN1"][i]["c"] for i in range(6, 11)]
     print("selfcheck 5/6: look-ahead leak is caught; honest access works")
 
-    # 6. real-tape sanity (only if collected)
-    if os.path.exists(tape_path("AAPL")):
-        real = Tape.load()
-        assert len(real) >= 90, f"aligned real tape only {len(real)} bars"
-        assert real.dates == sorted(real.dates)
-        print(f"selfcheck 6/6: real tape aligned — {len(real)} common daily bars x {len(real.syms)} symbols")
+    # 6. real-tape sanity + venue-vs-bulk parity on the overlap window
+    if os.path.exists(tape_path("AAPL")) and os.path.exists(bulk_path("AAPL")):
+        venue = Tape.load()
+        assert len(venue) >= 35, f"aligned venue tape only {len(venue)} bars"
+        bulk_t = Tape.load(source="bulk")
+        assert len(bulk_t) >= 500, f"aligned bulk tape only {len(bulk_t)} bars"
+        # Parity: recent overlap only (bulk is split/div-adjusted — deep history diverges
+        # structurally; the recent window catches date misalignment and splits loudly,
+        # while ~2% tolerance absorbs dividend adjustments).
+        worst = ("", 0.0)
+        checked = 0
+        for sym in venue.syms:
+            vb = {b["date"]: b["c"] for b in venue.bars[sym]}
+            bb = {b["date"]: b["c"] for b in bulk_t.bars[sym]}
+            for d in sorted(set(vb) & set(bb))[:-1]:  # skip newest (bulk sources can lag)
+                rel = abs(vb[d] - bb[d]) / bb[d]
+                checked += 1
+                if rel > worst[1]:
+                    worst = (f"{sym}@{d}", rel)
+                assert rel < 0.02, (f"{sym} {d}: venue close {vb[d]} vs bulk {bb[d]} "
+                                    f"({rel:.1%}) — date misalignment or split?")
+        print(f"selfcheck 6/6: venue↔bulk parity on {checked} overlapping bars "
+              f"(worst {worst[0]} {worst[1]:.3%}) — inferred dates validated")
     else:
-        print("selfcheck 6/6: skipped (no real tape yet — run collect)")
+        print("selfcheck 6/6: skipped (need both collect and bulk tapes)")
     print("ALL SELFCHECKS PASS")
 
 
 # ---------------------------------------------------------------- baselines
 
-def baselines(window_start="2026-06-08"):
-    full = Tape.load()
-    start_t = next(i for i, d in enumerate(full.dates) if d >= window_start)
-    warmup = start_t - 1  # decisions start on the last bar before the window
+def run_baseline_set(tape, window_start, label):
+    """flat/B&H/momentum on one tape; warmup is at least 20 bars, so the effective
+    window start is max(requested, bar 21) — crypto history is only ~61 days deep."""
+    start_t = next((i for i, d in enumerate(tape.dates) if d >= window_start), 21)
+    warmup = max(20, start_t - 1)
     results = {}
     for name, pol in [("flat", flat_policy),
                       ("buy_and_hold", make_buy_and_hold(warmup)),
                       ("momentum", make_momentum())]:
-        curve, fills = run_sim(full, pol, warmup=warmup)
-        ident = replay_fills(full, fills, warmup=warmup)
+        curve, fills = run_sim(tape, pol, warmup=warmup)
+        ident = replay_fills(tape, fills, warmup=warmup)
         assert all(abs(x - y) < 0.01 for x, y in zip(curve, ident)), f"{name}: accounting mismatch"
         ret = (curve[-1] / 100_000.0 - 1) * 100
         results[name] = {"return_pct": round(ret, 3), "n_fills": len(fills),
-                         "final_equity": round(curve[-1], 2)}
-        print(f"{name:14} {ret:+7.2f}%  fills={len(fills):3}  "
-              f"window {full.dates[warmup + 1]} → {full.dates[-1]}")
+                         "final_equity": round(curve[-1], 2),
+                         "window": [tape.dates[warmup + 1], tape.dates[-1]]}
+        print(f"[{label}] {name:14} {ret:+7.2f}%  fills={len(fills):3}  "
+              f"window {tape.dates[warmup + 1]} → {tape.dates[-1]}")
+    return results
+
+
+def baselines(window_start="2026-06-08"):
+    # bulk tape has the depth (venue tape is 100/61 bars); parity selfcheck ties them
+    results = {"universe18": run_baseline_set(Tape.load(source="bulk"), window_start, "18-sym"),
+               "stocks_only": run_baseline_set(Tape.load(symbols=STOCKS, source="bulk"), window_start, "stocks")}
 
     # against the archived leaderboard (agents' lifetime total_return_pct — see README caveat)
-    arch = sorted(os.path.join("/home/bob/clawstreet-archive/data", d, "leaderboard.json")
-                  for d in os.listdir("/home/bob/clawstreet-archive/data")
-                  if os.path.exists(os.path.join("/home/bob/clawstreet-archive/data", d, "leaderboard.json")))
+    arch_dir = os.environ.get("CLAWSTREET_ARCHIVE", os.path.expanduser("~/clawstreet-archive/data"))
+    arch = sorted(os.path.join(arch_dir, d, "leaderboard.json")
+                  for d in (os.listdir(arch_dir) if os.path.isdir(arch_dir) else [])
+                  if os.path.exists(os.path.join(arch_dir, d, "leaderboard.json")))
+    if not arch:
+        print("no leaderboard archive found — skipping board comparison")
     if arch:
         board = json.load(open(arch[-1]))["board"]
         rets = sorted(r["total_return_pct"] for r in board if r["total_return_pct"] is not None)
-        for name in ("buy_and_hold", "momentum"):
-            r = results[name]["return_pct"]
-            pct_below = 100 * sum(1 for x in rets if x < r) / len(rets)
-            results[name]["pct_of_board_below"] = round(pct_below, 1)
-            print(f"{name}: beats {pct_below:.0f}% of the {len(rets)}-agent board")
+        for setname in ("universe18", "stocks_only"):
+            for name in ("buy_and_hold", "momentum"):
+                r = results[setname][name]["return_pct"]
+                pct_below = 100 * sum(1 for x in rets if x < r) / len(rets)
+                results[setname][name]["pct_of_board_below"] = round(pct_below, 1)
+                print(f"{setname}/{name}: beats {pct_below:.0f}% of the {len(rets)}-agent board")
         q1, q3 = rets[len(rets) // 4], rets[3 * len(rets) // 4]
         results["board"] = {"snapshot": arch[-1], "n": len(rets), "iqr": [q1, q3]}
         print(f"board IQR: [{q1:+.2f}%, {q3:+.2f}%]")
+    # hypothesis 4: does turning costs off change the policy ordering?
+    global fill_cost
+    real_fill_cost = fill_cost
+    fill_cost = lambda sym, dq, px, dv: (px, 0.0)
+    try:
+        free = run_baseline_set(Tape.load(source="bulk"), window_start, "18-sym NO-COST")
+    finally:
+        fill_cost = real_fill_cost
+    order = sorted(("flat", "buy_and_hold", "momentum"),
+                   key=lambda n: results["universe18"][n]["return_pct"])
+    order_free = sorted(("flat", "buy_and_hold", "momentum"),
+                        key=lambda n: free[n]["return_pct"])
+    results["cost_sensitivity"] = {
+        "ordering_with_costs": order, "ordering_without": order_free,
+        "same_ordering": order == order_free,
+        "cost_drag_pp": {n: round(free[n]["return_pct"] - results["universe18"][n]["return_pct"], 3)
+                         for n in ("buy_and_hold", "momentum")}}
+    print(f"cost sensitivity: ordering {'UNCHANGED' if order == order_free else 'CHANGED'}; "
+          f"drag(pp) {results['cost_sensitivity']['cost_drag_pp']}")
     os.makedirs(os.path.join(HERE, "out"), exist_ok=True)
     json.dump(results, open(os.path.join(HERE, "out", "baselines.json"), "w"), indent=1)
     print("wrote out/baselines.json")
@@ -418,4 +541,4 @@ def baselines(window_start="2026-06-08"):
 
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "selfcheck"
-    {"collect": collect, "selfcheck": selfcheck, "baselines": baselines}[cmd]()
+    {"bulk": bulk, "collect": collect, "selfcheck": selfcheck, "baselines": baselines}[cmd]()
