@@ -116,11 +116,12 @@ def collect():
     total = 0
     for sym in UNIVERSE:
         crypto = sym.startswith("X:")
+        full_depth = 55 if crypto else 95  # crypto history is only ~61 bars deep
         for attempt in range(3):  # API sporadically returns short arrays
             h = _get(f"https://www.clawstreet.io/api/data/history?symbol={urllib.parse.quote(sym)}&periods=100",
                      key)[sym]
             time.sleep(PAUSE)
-            if len(h["prices"]) >= 95:
+            if len(h["prices"]) >= full_depth:
                 break
         o, hi, lo, c, v = h["open"], h["high"], h["low"], h["prices"], h["volumes"]
         n = len(c)
