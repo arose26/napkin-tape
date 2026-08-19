@@ -547,7 +547,7 @@ def plot(window_start="2026-06-08"):
     import matplotlib.pyplot as plt
 
     tape = Tape.load(source="bulk")
-    start_t = next(i for i, d in enumerate(tape.dates) if d >= window_start)
+    start_t = next((i for i, d in enumerate(tape.dates) if d >= window_start), 21)
     warmup = max(20, start_t - 1)
     curves = {}
     for name, pol in [("buy & hold", make_buy_and_hold(warmup)),
@@ -560,6 +560,8 @@ def plot(window_start="2026-06-08"):
     arch = sorted(os.path.join(arch_dir, d, "leaderboard.json")
                   for d in (os.listdir(arch_dir) if os.path.isdir(arch_dir) else [])
                   if os.path.exists(os.path.join(arch_dir, d, "leaderboard.json")))
+    if not arch:
+        raise SystemExit("plot needs a leaderboard archive snapshot (see baselines)")
     board = [r["total_return_pct"] for r in json.load(open(arch[-1]))["board"]
              if r["total_return_pct"] is not None]
 
