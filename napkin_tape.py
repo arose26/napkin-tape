@@ -540,6 +540,87 @@ def baselines(window_start="2026-06-08"):
     print("wrote out/baselines.json")
 
 
+def plot(window_start="2026-06-08"):
+    """Hero image: baseline equity curves + where they land in the 200-agent board."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    tape = Tape.load(source="bulk")
+    start_t = next(i for i, d in enumerate(tape.dates) if d >= window_start)
+    warmup = max(20, start_t - 1)
+    curves = {}
+    for name, pol in [("buy & hold", make_buy_and_hold(warmup)),
+                      ("momentum", make_momentum()), ("flat", flat_policy)]:
+        curves[name], _ = run_sim(tape, pol, warmup=warmup)
+    xdates = tape.dates[warmup + 1:]
+    xticks = list(range(0, len(xdates), max(1, len(xdates) // 5)))
+
+    arch_dir = os.environ.get("CLAWSTREET_ARCHIVE", os.path.expanduser("~/clawstreet-archive/data"))
+    arch = sorted(os.path.join(arch_dir, d, "leaderboard.json")
+                  for d in (os.listdir(arch_dir) if os.path.isdir(arch_dir) else [])
+                  if os.path.exists(os.path.join(arch_dir, d, "leaderboard.json")))
+    board = [r["total_return_pct"] for r in json.load(open(arch[-1]))["board"]
+             if r["total_return_pct"] is not None]
+
+    C = {"buy & hold": "#2a78d6", "momentum": "#eb6834", "flat": "#8a897f"}
+    INK, MUTED = "#1a1a19", "#6f6e64"
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4.2), dpi=150)
+    fig.patch.set_facecolor("white")
+    for ax in (ax1, ax2):
+        ax.set_facecolor("white")
+        for s in ("top", "right"):
+            ax.spines[s].set_visible(False)
+        ax.tick_params(colors=MUTED, labelsize=8)
+        for s in ("left", "bottom"):
+            ax.spines[s].set_color(MUTED)
+        ax.grid(axis="y", color="#e6e5dc", lw=0.6)
+        ax.set_axisbelow(True)
+
+    for name, curve in curves.items():
+        pct = [100 * (v / 100_000 - 1) for v in curve]
+        ax1.plot(pct, color=C[name], lw=2 if name != "flat" else 1.2,
+                 ls="-" if name != "flat" else "--", label=name)
+        ax1.annotate(f" {name} {pct[-1]:+.1f}%", (len(pct) - 1, pct[-1]),
+                     color=C[name], fontsize=8.5, fontweight="bold", va="center")
+    ax1.set_xticks(xticks, [xdates[i][5:] for i in xticks])
+    ax1.set_xlim(0, len(xdates) * 1.22)
+    ax1.set_title("Baselines in the replay sim (window 2026-06-08 →)",
+                  color=INK, fontsize=10, loc="left")
+    ax1.set_ylabel("return %", color=MUTED, fontsize=8)
+
+    n_zero = sum(1 for x in board if x == 0)
+    lo, hi = -16, 18
+    off = sum(1 for x in board if x < lo)
+    ax2.hist([max(x, lo) for x in board], bins=[b * 1.0 for b in range(lo, hi + 1)],
+             color="#b8c9e0", edgecolor="white", lw=0.5)
+    ax2.set_yscale("log")
+    ax2.set_ylim(0.5, 400)
+    ax2.set_xlim(lo - 0.5, hi + 0.5)
+    for name in ("buy & hold", "momentum"):
+        r = 100 * (curves[name][-1] / 100_000 - 1)
+        beats = 100 * sum(1 for x in board if x < r) / len(board)
+        ax2.axvline(r, color=C[name], lw=2)
+        ax2.annotate(f"{name}\nbeats {beats:.0f}%", (r, 30),
+                     color=C[name], fontsize=8.5, fontweight="bold",
+                     ha="left" if name == "buy & hold" else "right",
+                     xytext=(4 if name == "buy & hold" else -4, 0), textcoords="offset points")
+    ax2.annotate(f"{n_zero} of {len(board)} agents never traded (0%)\n"
+                 f"{off} below {lo}% pooled at the left edge",
+                 (lo, 280), color=MUTED, fontsize=8, ha="left", va="top")
+    ax2.set_title(f"…vs the live {len(board)}-agent ClawStreet board (lifetime return %)",
+                  color=INK, fontsize=10, loc="left")
+    ax2.set_xlabel("total return %", color=MUTED, fontsize=8)
+    ax2.set_ylabel("agents", color=MUTED, fontsize=8)
+
+    fig.tight_layout()
+    os.makedirs(os.path.join(HERE, "assets"), exist_ok=True)
+    out = os.path.join(HERE, "assets", "hero.png")
+    fig.savefig(out, bbox_inches="tight")
+    print("wrote", out)
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "selfcheck"
-    {"bulk": bulk, "collect": collect, "selfcheck": selfcheck, "baselines": baselines}[cmd]()
+    {"bulk": bulk, "collect": collect, "selfcheck": selfcheck,
+     "baselines": baselines, "plot": plot}[cmd]()

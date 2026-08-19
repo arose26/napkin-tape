@@ -15,6 +15,8 @@ Every later repo trains inside this sim. If it leaks one bar of the future, or d
 of cash, or fills orders cheaper than the venue would, everything downstream is fiction.
 So this repo is mostly selfchecks.
 
+![baselines vs the live board](assets/hero.png)
+
 ## What's in the tape
 
 Fixed universe of 18 symbols: 15 liquid megacaps (AAPL MSFT NVDA AMZN GOOGL META TSLA AVGO
