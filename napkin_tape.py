@@ -174,7 +174,7 @@ def bulk_path(sym):
     return os.path.join(TAPE_DIR, sym.replace(":", "_") + ".bulk.jsonl")
 
 
-def _yahoo_daily(sym, years=3):
+def _yahoo_daily(sym, years=10):
     """Yahoo v8 chart JSON, no key. Timestamps included; volume in shares;
     split-adjusted quotes (dividends NOT backed out — matches venue closely)."""
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range={years}y&interval=1d"
@@ -196,7 +196,7 @@ def _yahoo_daily(sym, years=3):
     return rows
 
 
-def _coinbase_daily(sym, years=3):
+def _coinbase_daily(sym, years=10):
     """Coinbase Exchange public candles, USD pairs, 300 bars/call, no key."""
     product = {"X:BTCUSD": "BTC-USD", "X:ETHUSD": "ETH-USD", "X:SOLUSD": "SOL-USD"}[sym]
     rows, end = {}, datetime.now(ZoneInfo("UTC"))
@@ -220,8 +220,14 @@ def _coinbase_daily(sym, years=3):
 def bulk():
     os.makedirs(TAPE_DIR, exist_ok=True)
     for sym in UNIVERSE:
+        if os.path.exists(bulk_path(sym)):
+            existing = sum(1 for _ in open(bulk_path(sym)))
+            if existing >= 1800:
+                print(f"bulk: {sym:10} already exists ({existing} bars), skipping")
+                continue
+            print(f"bulk: {sym:10} existing file too short ({existing} bars), re-fetching")
         rows = _coinbase_daily(sym) if sym.startswith("X:") else _yahoo_daily(sym)
-        assert len(rows) >= 700, f"{sym}: bulk only returned {len(rows)} daily bars"
+        assert len(rows) >= 1800, f"{sym}: bulk only returned {len(rows)} daily bars"
         ds = [r["date"] for r in rows]
         assert ds == sorted(set(ds)), f"{sym}: bulk dates not strictly increasing"
         with open(bulk_path(sym), "w") as f:
